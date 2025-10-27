@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/examples/">
+    <Project Path="examples/FlvStreamingDemo/FlvStreamingDemo.csproj" />
+  </Folder>
+  <Folder Name="/samples/" />
+  <Folder Name="/src/">
+    <Project Path="src/Cherry.Flv.AspNetCore/Cherry.Flv.AspNetCore.csproj" />
+    <Project Path="src/Cherry.Flv/Cherry.Flv.csproj" Id="b7ce55de-6894-4051-a249-3a67765312a2" />
+    <Project Path="src/Cherry.Media/Cherry.Media.csproj" />
+    <Project Path="src/Cherry.Rtmp.Client/Cherry.Rtmp.Client.csproj" Id="9bde0fb6-5b69-4d86-b105-590c3ccabb43" />
+    <Project Path="src/Cherry.Rtmp.Server/Cherry.Rtmp.Server.csproj" Id="bb727ee1-7c09-4158-9cf5-26bb08e00512" />
+    <Project Path="src/Cherry.Rtmp/Cherry.Rtmp.csproj" Id="28e40bd1-014a-44f8-afd5-436499b60655" />
+    <Project Path="src/Cherry.Rtsp.Client/Cherry.Rtsp.Client.csproj" Id="2d396009-0676-419f-a83f-32152ee05cc2" />
+    <Project Path="src/Cherry.Rtsp.Server/Cherry.Rtsp.Server.csproj" Id="a19db103-286f-4c59-b26b-c2981a2b90fb" />
+    <Project Path="src/Cherry.Rtsp/Cherry.Rtsp.csproj" Id="19e55efe-0076-41a3-ae39-d62d68aee8f6" />
+  </Folder>
+  <Folder Name="/tests/" />
+</Solution>

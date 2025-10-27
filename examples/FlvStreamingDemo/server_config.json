@@ -1,0 +1,25 @@
+{
+  "RtmpPort": 1935,
+  "RtspPort": 554,
+  "HlsPort": 8080,
+  "VirtualHosts": {
+    "default": {
+      "Name": "default",
+      "RequireAuth": false,
+      "Users": {},
+      "Streams": {
+        "live": {
+          "Key": "live",
+          "IsPublishing": true,
+          "IsPlaying": true,
+          "RequireAuth": false,
+          "PublisherUser": null,
+          "PublishTokens": [],
+          "PlayTokens": [],
+          "MaxConnections": 100,
+          "MaxDuration": null
+        }
+      }
+    }
+  }
+}
