@@ -273,12 +273,14 @@ namespace Cherry.Rtmp.Server
 
             try
             {
-                while (true)
+                var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30)); // 30秒超时
+
+                while (!timeoutCts.Token.IsCancellationRequested)
                 {
-                    int bytesRead = await _stream.ReadAsync(buffer);
+                    int bytesRead = await _stream.ReadAsync(buffer, timeoutCts.Token);
                     if (bytesRead == 0)
                     {
-                        Console.WriteLine("Client closed connection");
+                        Console.WriteLine("Client closed connection (bytesRead == 0)");
                         break; // 客户端关闭连接
                     }
 
@@ -288,14 +290,34 @@ namespace Cherry.Rtmp.Server
                     int offset = 0;
                     while (offset < bytesRead)
                     {
-                        var chunk = ParseChunk(buffer.AsSpan(offset, bytesRead - offset), ref offset);
-                        if (chunk == null) break;
+                        var (chunk, bytesConsumed) = ParseChunk(buffer.AsSpan(offset, bytesRead - offset));
+                        if (chunk == null) 
+                        {
+                            Console.WriteLine($"Failed to parse chunk at offset {offset}, remaining data: {bytesRead - offset} bytes");
+                            break;
+                        }
 
+                        offset += bytesConsumed;
                         Console.WriteLine($"Parsed chunk: Type={chunk.MessageType}, Length={chunk.MessageLength}, StreamId={chunk.MessageStreamId}");
 
                         // 处理消息
                         await ProcessChunkAsync(chunk);
                     }
+
+                    // 检查是否还有未处理的数据
+                    if (offset < bytesRead)
+                    {
+                        Console.WriteLine($"Warning: {bytesRead - offset} bytes of data not processed");
+                    }
+                }
+
+                if (timeoutCts.Token.IsCancellationRequested)
+                {
+                    Console.WriteLine("Connection timed out waiting for client data - OBS may have disconnected or stopped sending commands");
+                    Console.WriteLine("This could indicate:");
+                    Console.WriteLine("1. OBS configuration issue (check RTMP URL: rtmp://localhost:1935/live)");
+                    Console.WriteLine("2. Connect response format problem");
+                    Console.WriteLine("3. OBS stopped the connection process");
                 }
             }
             catch (IOException ex) when (ex.InnerException is SocketException socketEx &&
@@ -303,19 +325,25 @@ namespace Cherry.Rtmp.Server
                                         socketEx.SocketErrorCode == SocketError.ConnectionAborted))
             {
                 // 客户端断开连接，正常情况
-                Console.WriteLine("Client disconnected during message processing");
+                Console.WriteLine("Client disconnected during message processing (normal disconnection)");
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("Connection cancelled");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error processing messages: {ex.Message}");
+                Console.WriteLine($"Unexpected error during message processing: {ex.Message}");
+                Console.WriteLine($"Stack trace: {ex.StackTrace}");
             }
         }
 
-        private RtmpChunk? ParseChunk(ReadOnlySpan<byte> data, ref int offset)
+        private (RtmpChunk? chunk, int bytesConsumed) ParseChunk(ReadOnlySpan<byte> data)
         {
-            if (offset + 1 > data.Length) return null;
+            int localOffset = 0;
+            if (localOffset + 1 > data.Length) return (null, 0);
 
-            byte firstByte = data[offset++];
+            byte firstByte = data[localOffset++];
             byte format = (byte)(firstByte >> 6);
             uint chunkStreamId = (uint)(firstByte & 0x3F);
 
@@ -323,15 +351,15 @@ namespace Cherry.Rtmp.Server
 
             if (chunkStreamId == 0)
             {
-                if (offset + 1 > data.Length) return null;
-                chunkStreamId = (uint)(data[offset++] + 64);
+                if (localOffset + 1 > data.Length) return (null, 0);
+                chunkStreamId = (uint)(data[localOffset++] + 64);
                 Console.WriteLine($"Extended chunk stream ID: {chunkStreamId}");
             }
             else if (chunkStreamId == 1)
             {
-                if (offset + 2 > data.Length) return null;
-                chunkStreamId = (uint)(data[offset] + (data[offset + 1] << 8) + 64);
-                offset += 2;
+                if (localOffset + 2 > data.Length) return (null, 0);
+                chunkStreamId = (uint)(data[localOffset] + (data[localOffset + 1] << 8) + 64);
+                localOffset += 2;
                 Console.WriteLine($"Extended chunk stream ID: {chunkStreamId}");
             }
 
@@ -353,33 +381,36 @@ namespace Cherry.Rtmp.Server
             switch (format)
             {
                 case 0: // 11字节头
-                    if (offset + 11 > data.Length) return null;
-                    chunk.Timestamp = ReadUInt24(data, offset);
-                    chunk.MessageLength = ReadUInt24(data, offset + 3);
-                    chunk.MessageType = (RtmpMessageType)data[offset + 6];
-                    chunk.MessageStreamId = ReadUInt32LittleEndian(data, offset + 7);
-                    offset += 11;
+                    if (localOffset + 11 > data.Length) return (null, 0);
+                    chunk.Timestamp = ReadUInt24(data, localOffset);
+                    chunk.MessageLength = ReadUInt24(data, localOffset + 3);
+                    chunk.MessageType = (RtmpMessageType)data[localOffset + 6];
+                    chunk.MessageStreamId = ReadUInt32LittleEndian(data, localOffset + 7);
+                    localOffset += 11;
                     Console.WriteLine($"Format 0: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
+                    Console.WriteLine($"Raw header data: {BitConverter.ToString(data.Slice(localOffset - 11, 11).ToArray())}");
                     break;
                 case 1: // 7字节头
-                    if (offset + 7 > data.Length) return null;
-                    chunk.Timestamp = ReadUInt24(data, offset);
-                    chunk.MessageLength = ReadUInt24(data, offset + 3);
-                    chunk.MessageType = (RtmpMessageType)data[offset + 6];
+                    if (localOffset + 7 > data.Length) return (null, 0);
+                    chunk.Timestamp = ReadUInt24(data, localOffset);
+                    chunk.MessageLength = ReadUInt24(data, localOffset + 3);
+                    chunk.MessageType = (RtmpMessageType)data[localOffset + 6];
                     chunk.Timestamp += prevChunk.Timestamp;
                     chunk.MessageLength = prevChunk.MessageLength;
                     chunk.MessageStreamId = prevChunk.MessageStreamId;
-                    offset += 7;
+                    localOffset += 7;
                     Console.WriteLine($"Format 1: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
+                    Console.WriteLine($"Raw header data: {BitConverter.ToString(data.Slice(localOffset - 7, 7).ToArray())}");
                     break;
                 case 2: // 3字节头
-                    if (offset + 3 > data.Length) return null;
-                    chunk.Timestamp = ReadUInt24(data, offset) + prevChunk.Timestamp;
+                    if (localOffset + 3 > data.Length) return (null, 0);
+                    chunk.Timestamp = ReadUInt24(data, localOffset) + prevChunk.Timestamp;
                     chunk.MessageLength = prevChunk.MessageLength;
                     chunk.MessageType = prevChunk.MessageType;
                     chunk.MessageStreamId = prevChunk.MessageStreamId;
-                    offset += 3;
+                    localOffset += 3;
                     Console.WriteLine($"Format 2: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
+                    Console.WriteLine($"Raw header data: {BitConverter.ToString(data.Slice(localOffset - 3, 3).ToArray())}");
                     break;
                 case 3: // 0字节头
                     chunk.Timestamp = prevChunk.Timestamp;
@@ -394,16 +425,16 @@ namespace Cherry.Rtmp.Server
 
             // 读取数据
             int dataSize = Math.Min((int)_chunkSize, (int)chunk.MessageLength - chunk.Data.Count);
-            Console.WriteLine($"Reading data: chunkSize={_chunkSize}, messageLength={chunk.MessageLength}, currentDataCount={chunk.Data.Count}, dataSize={dataSize}, availableData={data.Length - offset}");
+            Console.WriteLine($"Reading data: chunkSize={_chunkSize}, messageLength={chunk.MessageLength}, currentDataCount={chunk.Data.Count}, dataSize={dataSize}, availableData={data.Length - localOffset}");
 
-            if (offset + dataSize > data.Length)
+            if (localOffset + dataSize > data.Length)
             {
                 Console.WriteLine("Not enough data available, waiting for more");
-                return null;
+                return (null, 0);
             }
 
-            chunk.Data.AddRange(data.Slice(offset, dataSize));
-            offset += dataSize;
+            chunk.Data.AddRange(data.Slice(localOffset, dataSize));
+            localOffset += dataSize;
 
             Console.WriteLine($"Added {dataSize} bytes, total data: {chunk.Data.Count}/{chunk.MessageLength}");
 
@@ -411,19 +442,22 @@ namespace Cherry.Rtmp.Server
             if (chunk.Data.Count >= chunk.MessageLength)
             {
                 Console.WriteLine("Complete chunk received");
-                return chunk;
+                return (chunk, localOffset);
             }
 
             Console.WriteLine("Chunk incomplete, waiting for more data");
-            return null;
+            return (null, 0);
         }
 
         private async Task ProcessChunkAsync(RtmpChunk chunk)
         {
+            Console.WriteLine($"Processing chunk: Type={chunk.MessageType}, Length={chunk.MessageLength}");
+
             switch (chunk.MessageType)
             {
                 case RtmpMessageType.SetChunkSize:
                     _chunkSize = ReadUInt32BigEndian(chunk.Data.ToArray());
+                    Console.WriteLine($"Set chunk size to {_chunkSize}");
                     break;
 
                 case RtmpMessageType.WindowAcknowledgementSize:
@@ -448,6 +482,10 @@ namespace Cherry.Rtmp.Server
                 case RtmpMessageType.Video:
                     ProcessVideoData(chunk);
                     break;
+
+                default:
+                    Console.WriteLine($"Unhandled message type: {chunk.MessageType}");
+                    break;
             }
         }
 
@@ -462,6 +500,8 @@ namespace Cherry.Rtmp.Server
             }
 
             Console.WriteLine($"Received AMF command: {command.CommandName}, TransactionId: {command.TransactionId}");
+            Console.WriteLine($"Command properties: {string.Join(", ", command.Properties.Select(p => $"{p.Key}={p.Value}"))}");
+            Console.WriteLine($"Command arguments: {string.Join(", ", command.Arguments.Select(a => a?.ToString() ?? "null"))}");
 
             switch (command.CommandName)
             {
@@ -485,6 +525,28 @@ namespace Cherry.Rtmp.Server
 
         private async Task HandleConnectAsync(AmfCommand command)
         {
+            Console.WriteLine("Handling connect command");
+
+            // 检查app参数，如果为空则设置为默认值
+            string app = command.Properties.GetValueOrDefault("app", "").ToString() ?? "";
+            if (string.IsNullOrEmpty(app))
+            {
+                app = "live"; // 默认应用名称
+                Console.WriteLine($"Empty app parameter, using default: {app}");
+            }
+
+            // 存储应用信息
+            Stream.AppName = app;
+
+            // 发送控制消息（在connect响应之前）
+            await SendWindowAcknowledgementSizeAsync();
+            Console.WriteLine("Window acknowledgement size sent");
+
+            await SendSetPeerBandwidthAsync();
+            Console.WriteLine("Set peer bandwidth sent");
+
+            // 注意：StreamBegin将在publish开始时发送
+
             // 发送_connect响应
             var response = new AmfCommand
             {
@@ -492,8 +554,10 @@ namespace Cherry.Rtmp.Server
                 TransactionId = command.TransactionId,
                 Properties = new Dictionary<string, object>
                 {
-                    ["fmsVer"] = "FMS/3,0,1,123",
-                    ["capabilities"] = 31.0
+                    ["fmsVer"] = "FMS/3.5.1",
+                    ["capabilities"] = 239.0,
+                    ["objectEncoding"] = 0.0,
+                    ["app"] = app // 包含app参数
                 },
                 Info = new Dictionary<string, object>
                 {
@@ -503,11 +567,15 @@ namespace Cherry.Rtmp.Server
                 }
             };
 
+            Console.WriteLine("Sending connect response");
             await SendCommandAsync(response);
+            Console.WriteLine("Connect response sent");
         }
 
         private async Task HandleCreateStreamAsync(AmfCommand command)
         {
+            Console.WriteLine("Handling createStream command");
+
             var response = new AmfCommand
             {
                 CommandName = "_result",
@@ -515,7 +583,9 @@ namespace Cherry.Rtmp.Server
                 StreamId = 1
             };
 
+            Console.WriteLine("Sending createStream response");
             await SendCommandAsync(response);
+            Console.WriteLine("CreateStream response sent");
         }
 
         private async Task HandlePublishAsync(AmfCommand command)
@@ -525,7 +595,7 @@ namespace Cherry.Rtmp.Server
             string publishingName = command.Arguments[1]?.ToString() ?? "";
             string publishingType = command.Arguments.Count > 2 ? command.Arguments[2]?.ToString() ?? "" : "";
 
-            Console.WriteLine($"Publish request: name={publishingName}, type={publishingType}");
+            Console.WriteLine($"Handling publish command: name={publishingName}, type={publishingType}");
 
             // 检查授权
             if (!ValidatePublishAuth(publishingName))
@@ -535,7 +605,7 @@ namespace Cherry.Rtmp.Server
                 {
                     CommandName = "onStatus",
                     TransactionId = 0,
-                    Info = new Dictionary<string, object>
+                    Properties = new Dictionary<string, object>
                     {
                         ["level"] = "error",
                         ["code"] = "NetStream.Publish.BadName",
@@ -555,7 +625,7 @@ namespace Cherry.Rtmp.Server
             {
                 CommandName = "onStatus",
                 TransactionId = 0,
-                Info = new Dictionary<string, object>
+                Properties = new Dictionary<string, object>
                 {
                     ["level"] = "status",
                     ["code"] = "NetStream.Publish.Start",
@@ -563,8 +633,14 @@ namespace Cherry.Rtmp.Server
                 }
             };
 
+            Console.WriteLine("Sending publish success response");
             await SendCommandAsync(response);
-            Console.WriteLine($"Publish started for: {publishingName}");
+            Console.WriteLine($"Publish started for: {publishingName} - OBS should now start streaming!");
+
+            // 发送stream begin user control message
+            await SendStreamBeginAsync();
+            Console.WriteLine("Stream begin sent for publishing");
+
             StreamStarted?.Invoke(this, publishingName);
         }
 
@@ -578,7 +654,7 @@ namespace Cherry.Rtmp.Server
             {
                 CommandName = "onStatus",
                 TransactionId = 0,
-                Info = new Dictionary<string, object>
+                Properties = new Dictionary<string, object>
                 {
                     ["level"] = "status",
                     ["code"] = "NetStream.Play.Start",
@@ -648,8 +724,12 @@ namespace Cherry.Rtmp.Server
 
         private async Task SendCommandAsync(AmfCommand command)
         {
+            Console.WriteLine($"Sending AMF command: {command.CommandName}, TransactionId: {command.TransactionId}");
+
             // 实现AMF编码和发送
             var data = EncodeAmfCommand(command);
+            Console.WriteLine($"Encoded AMF command data: {BitConverter.ToString(data)}");
+
             var chunk = new RtmpChunk
             {
                 Format = 0,
@@ -662,6 +742,7 @@ namespace Cherry.Rtmp.Server
             };
 
             await SendChunkAsync(chunk);
+            Console.WriteLine($"Sent AMF command: {command.CommandName}");
         }
 
         private async Task SendWindowAcknowledgementSizeAsync()
@@ -683,10 +764,58 @@ namespace Cherry.Rtmp.Server
             await SendChunkAsync(chunk);
         }
 
+        private async Task SendSetPeerBandwidthAsync()
+        {
+            var data = new List<byte>();
+            // Bandwidth (4 bytes, big endian)
+            var bandwidth = BitConverter.GetBytes(2500000); // 2.5 Mbps
+            Array.Reverse(bandwidth);
+            data.AddRange(bandwidth);
+            // Limit type (1 byte) - 2 = dynamic
+            data.Add(2);
+
+            var chunk = new RtmpChunk
+            {
+                Format = 0,
+                ChunkStreamId = 2,
+                Timestamp = 0,
+                MessageLength = 5,
+                MessageType = RtmpMessageType.SetPeerBandwidth,
+                MessageStreamId = 0,
+                Data = data
+            };
+
+            await SendChunkAsync(chunk);
+        }
+
+        private async Task SendStreamBeginAsync()
+        {
+            var data = new List<byte>();
+            // Event type (2 bytes, big endian) - 0 = Stream Begin
+            data.AddRange(new byte[] { 0x00, 0x00 });
+            // Stream ID (4 bytes, big endian) - 0
+            data.AddRange(new byte[] { 0x00, 0x00, 0x00, 0x00 });
+
+            var chunk = new RtmpChunk
+            {
+                Format = 0,
+                ChunkStreamId = 2,
+                Timestamp = 0,
+                MessageLength = 6,
+                MessageType = RtmpMessageType.UserControl,
+                MessageStreamId = 0,
+                Data = data
+            };
+
+            await SendChunkAsync(chunk);
+        }
+
         private async Task SendChunkAsync(RtmpChunk chunk)
         {
+            Console.WriteLine($"Sending chunk: Type={chunk.MessageType}, Length={chunk.MessageLength}, StreamId={chunk.MessageStreamId}");
             var data = EncodeChunk(chunk);
             await _stream.WriteAsync(data);
+            Console.WriteLine($"Sent {data.Length} bytes to client");
         }
 
         private byte[] EncodeChunk(RtmpChunk chunk)
@@ -739,13 +868,28 @@ namespace Cherry.Rtmp.Server
         // AMF解析辅助方法
         private string? ReadAmfString(byte[] data, ref int offset)
         {
-            if (offset + 2 > data.Length) return null;
+            if (offset + 3 > data.Length) return null;
 
             // AMF0 string marker
             if (data[offset] != 0x02) return null;
             offset++;
 
             // String length
+            int length = (data[offset] << 8) | data[offset + 1];
+            offset += 2;
+
+            if (offset + length > data.Length) return null;
+
+            var str = System.Text.Encoding.UTF8.GetString(data, offset, length);
+            offset += length;
+            return str;
+        }
+
+        private string? ReadAmfStringValue(byte[] data, ref int offset)
+        {
+            if (offset + 2 > data.Length) return null;
+
+            // String length (type marker already consumed)
             int length = (data[offset] << 8) | data[offset + 1];
             offset += 2;
 
@@ -785,7 +929,11 @@ namespace Cherry.Rtmp.Server
             if (offset >= data.Length) return null;
 
             // AMF0 object marker
-            if (data[offset] != 0x03) return null;
+            if (data[offset] != 0x03)
+            {
+                Console.WriteLine($"Expected AMF object marker 0x03, got 0x{data[offset]:X2}");
+                return null;
+            }
             offset++;
 
             var obj = new Dictionary<string, object>();
@@ -799,7 +947,7 @@ namespace Cherry.Rtmp.Server
                     break;
                 }
 
-                var key = ReadAmfString(data, ref offset);
+                var key = ReadAmfPropertyName(data, ref offset);
                 if (key == null) break;
 
                 var value = ReadAmfValue(data, ref offset);
@@ -812,6 +960,21 @@ namespace Cherry.Rtmp.Server
             return obj;
         }
 
+        private string? ReadAmfPropertyName(byte[] data, ref int offset)
+        {
+            if (offset + 2 > data.Length) return null;
+
+            // Property name length (2 bytes, big-endian)
+            int length = (data[offset] << 8) | data[offset + 1];
+            offset += 2;
+
+            if (offset + length > data.Length) return null;
+
+            var str = System.Text.Encoding.UTF8.GetString(data, offset, length);
+            offset += length;
+            return str;
+        }
+
         private object? ReadAmfValue(byte[] data, ref int offset)
         {
             if (offset >= data.Length) return null;
@@ -822,7 +985,7 @@ namespace Cherry.Rtmp.Server
                 case 0x00: // number
                     return ReadAmfNumber(data, ref offset);
                 case 0x02: // string
-                    return ReadAmfString(data, ref offset);
+                    return ReadAmfStringValue(data, ref offset);
                 case 0x03: // object
                     return ReadAmfObject(data, ref offset);
                 default:
@@ -835,18 +998,23 @@ namespace Cherry.Rtmp.Server
             try
             {
                 int offset = 0;
+                Console.WriteLine($"Parsing AMF command, data length: {data.Length}");
+                Console.WriteLine($"AMF data: {BitConverter.ToString(data)}");
 
                 // 读取命令名
                 if (offset >= data.Length) return null;
                 var commandName = ReadAmfString(data, ref offset);
                 if (commandName == null) return null;
+                Console.WriteLine($"Command name: {commandName}, offset after name: {offset}");
 
                 // 读取事务ID
                 if (offset >= data.Length) return null;
                 var transactionId = ReadAmfNumber(data, ref offset);
+                Console.WriteLine($"Transaction ID: {transactionId}, offset after transactionId: {offset}");
 
                 // 读取命令对象
                 var properties = ReadAmfObject(data, ref offset);
+                Console.WriteLine($"Properties count: {properties?.Count ?? 0}, offset after properties: {offset}");
 
                 // 读取其他参数
                 var arguments = new List<object?>();
@@ -854,7 +1022,10 @@ namespace Cherry.Rtmp.Server
                 {
                     var arg = ReadAmfValue(data, ref offset);
                     arguments.Add(arg);
+                    Console.WriteLine($"Read argument: {arg}, offset: {offset}");
                 }
+
+                Console.WriteLine($"Total arguments: {arguments.Count}");
 
                 return new AmfCommand
                 {
@@ -865,8 +1036,10 @@ namespace Cherry.Rtmp.Server
                     Arguments = arguments
                 };
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Error parsing AMF command: {ex.Message}");
+                Console.WriteLine($"Stack trace: {ex.StackTrace}");
                 return null;
             }
         }
@@ -882,7 +1055,17 @@ namespace Cherry.Rtmp.Server
             // Transaction ID
             WriteAmfNumber(writer, command.TransactionId);
 
-            // Properties (for _result and onStatus)
+            // Properties object (for connect _result)
+            if (command.Properties.Count > 0)
+            {
+                WriteAmfObject(writer, command.Properties);
+            }
+            else
+            {
+                WriteAmfNull(writer);
+            }
+
+            // Info object (for connect _result and onStatus)
             if (command.Info.Count > 0)
             {
                 WriteAmfObject(writer, command.Info);
@@ -962,7 +1145,7 @@ namespace Cherry.Rtmp.Server
 
         private uint ReadUInt24(ReadOnlySpan<byte> data, int offset = 0)
         {
-            return (uint)(data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16));
+            return (uint)((data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]);
         }
 
         private uint ReadUInt32BigEndian(byte[] data, int offset = 0)
@@ -1023,6 +1206,7 @@ namespace Cherry.Rtmp.Server
     /// </summary>
     public class RtmpStream
     {
+        public string AppName { get; set; } = string.Empty;
         public string StreamKey { get; set; } = string.Empty;
         public bool IsPublishing { get; set; }
         public bool IsPlaying { get; set; }
