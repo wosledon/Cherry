@@ -319,16 +319,20 @@ namespace Cherry.Rtmp.Server
             byte format = (byte)(firstByte >> 6);
             uint chunkStreamId = (uint)(firstByte & 0x3F);
 
+            Console.WriteLine($"Parsing chunk: firstByte=0x{firstByte:X2}, format={format}, baseChunkStreamId={chunkStreamId}");
+
             if (chunkStreamId == 0)
             {
                 if (offset + 1 > data.Length) return null;
                 chunkStreamId = (uint)(data[offset++] + 64);
+                Console.WriteLine($"Extended chunk stream ID: {chunkStreamId}");
             }
             else if (chunkStreamId == 1)
             {
                 if (offset + 2 > data.Length) return null;
                 chunkStreamId = (uint)(data[offset] + (data[offset + 1] << 8) + 64);
                 offset += 2;
+                Console.WriteLine($"Extended chunk stream ID: {chunkStreamId}");
             }
 
             var chunk = new RtmpChunk
@@ -341,6 +345,7 @@ namespace Cherry.Rtmp.Server
             if (!_chunks.ContainsKey(chunkStreamId))
             {
                 _chunks[chunkStreamId] = new RtmpChunk();
+                Console.WriteLine($"Created new chunk for stream {chunkStreamId}");
             }
 
             var prevChunk = _chunks[chunkStreamId];
@@ -354,6 +359,7 @@ namespace Cherry.Rtmp.Server
                     chunk.MessageType = (RtmpMessageType)data[offset + 6];
                     chunk.MessageStreamId = ReadUInt32LittleEndian(data, offset + 7);
                     offset += 11;
+                    Console.WriteLine($"Format 0: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
                     break;
                 case 1: // 7字节头
                     if (offset + 7 > data.Length) return null;
@@ -364,6 +370,7 @@ namespace Cherry.Rtmp.Server
                     chunk.MessageLength = prevChunk.MessageLength;
                     chunk.MessageStreamId = prevChunk.MessageStreamId;
                     offset += 7;
+                    Console.WriteLine($"Format 1: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
                     break;
                 case 2: // 3字节头
                     if (offset + 3 > data.Length) return null;
@@ -372,12 +379,14 @@ namespace Cherry.Rtmp.Server
                     chunk.MessageType = prevChunk.MessageType;
                     chunk.MessageStreamId = prevChunk.MessageStreamId;
                     offset += 3;
+                    Console.WriteLine($"Format 2: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
                     break;
                 case 3: // 0字节头
                     chunk.Timestamp = prevChunk.Timestamp;
                     chunk.MessageLength = prevChunk.MessageLength;
                     chunk.MessageType = prevChunk.MessageType;
                     chunk.MessageStreamId = prevChunk.MessageStreamId;
+                    Console.WriteLine($"Format 3: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
                     break;
             }
 
@@ -385,17 +394,27 @@ namespace Cherry.Rtmp.Server
 
             // 读取数据
             int dataSize = Math.Min((int)_chunkSize, (int)chunk.MessageLength - chunk.Data.Count);
-            if (offset + dataSize > data.Length) return null;
+            Console.WriteLine($"Reading data: chunkSize={_chunkSize}, messageLength={chunk.MessageLength}, currentDataCount={chunk.Data.Count}, dataSize={dataSize}, availableData={data.Length - offset}");
+
+            if (offset + dataSize > data.Length)
+            {
+                Console.WriteLine("Not enough data available, waiting for more");
+                return null;
+            }
 
             chunk.Data.AddRange(data.Slice(offset, dataSize));
             offset += dataSize;
 
+            Console.WriteLine($"Added {dataSize} bytes, total data: {chunk.Data.Count}/{chunk.MessageLength}");
+
             // 检查是否收到完整消息
             if (chunk.Data.Count >= chunk.MessageLength)
             {
+                Console.WriteLine("Complete chunk received");
                 return chunk;
             }
 
+            Console.WriteLine("Chunk incomplete, waiting for more data");
             return null;
         }
 
