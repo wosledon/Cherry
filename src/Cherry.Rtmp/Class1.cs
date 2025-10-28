@@ -53,8 +53,8 @@ namespace Cherry.Rtmp
         private TcpClient? _client;
         private NetworkStream? _stream;
         private bool _isRunning;
-        private readonly Dictionary<uint, RtmpChunkHeader> _chunkHeaders = new();
-        private uint _chunkSize = 128;
+    private readonly RtmpChunkDecoder _decoder = new RtmpChunkDecoder();
+    private readonly RtmpChunkEncoder _encoder = new RtmpChunkEncoder();
 
         public bool IsRunning => _isRunning;
 
@@ -117,18 +117,41 @@ namespace Cherry.Rtmp
         {
             if (_stream == null) return;
 
-            var buffer = new byte[4096];
-            var chunkBuffer = new Dictionary<uint, List<byte>>();
+            var buffer = new byte[8192];
+
+            // 订阅解码器事件以便在解析到消息时输出通信内容
+            _decoder.MessageDecoded += (m) =>
+            {
+                Console.WriteLine($"[RTMP][IN] type={m.Header.MessageType} stream={m.Header.MessageStreamId} ts={m.Header.Timestamp} len={m.Payload.Length}");
+            };
+
+            // 订阅编码器事件以便在发送 chunk 前输出
+            _encoder.ChunkEncoded += (b) =>
+            {
+                Console.WriteLine($"[RTMP][OUT] chunk len={b.Length}");
+            };
 
             while (_isRunning)
             {
                 try
                 {
-                    int bytesRead = await _stream.ReadAsync(buffer);
+                    int bytesRead = await _stream.ReadAsync(buffer.AsMemory(0, buffer.Length));
                     if (bytesRead == 0) break;
 
-                    // 处理RTMP数据
-                    ProcessRtmpData(buffer.AsSpan(0, bytesRead), chunkBuffer);
+                    var span = new ReadOnlySpan<byte>(buffer, 0, bytesRead);
+                    foreach (var msg in _decoder.Feed(span))
+                    {
+                        // 处理控制消息（例如 SetChunkSize）
+                        if (msg.Header.MessageType == RtmpMessageType.SetChunkSize && msg.Payload.Length >= 4)
+                        {
+                            uint newSize = (uint)(msg.Payload[0] << 24 | msg.Payload[1] << 16 | msg.Payload[2] << 8 | msg.Payload[3]);
+                            _decoder.ChunkSize = (int)newSize;
+                            _encoder.ChunkSize = (int)newSize; // 同步更新发送端
+                            // 同步更新本地记录（若需要用于其他逻辑）
+                        }
+
+                        ProcessMessage(msg.Header, msg.Payload);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -138,99 +161,17 @@ namespace Cherry.Rtmp
             }
         }
 
-        private void ProcessRtmpData(ReadOnlySpan<byte> data, Dictionary<uint, List<byte>> chunkBuffer)
+        /// <summary>
+        /// 通过编码器将一条消息发送到网络（异步写入 stream）并输出发送信息
+        /// </summary>
+        public async System.Threading.Tasks.Task SendMessageAsync(RtmpMessage msg)
         {
-            int offset = 0;
+            if (_stream == null) throw new InvalidOperationException("Not connected");
 
-            while (offset < data.Length)
+            foreach (var chunk in _encoder.Encode(msg))
             {
-                var header = ParseChunkHeader(data, ref offset);
-                if (header == null) break;
-
-                // 获取或创建块缓冲区
-                if (!chunkBuffer.ContainsKey(header.ChunkStreamId))
-                {
-                    chunkBuffer[header.ChunkStreamId] = new List<byte>();
-                }
-
-                var buffer = chunkBuffer[header.ChunkStreamId];
-
-                // 读取块数据
-                int chunkDataSize = Math.Min((int)_chunkSize, (int)header.MessageLength - buffer.Count);
-                if (offset + chunkDataSize > data.Length) break;
-
-                buffer.AddRange(data.Slice(offset, chunkDataSize));
-                offset += chunkDataSize;
-
-                // 检查是否收到完整消息
-                if (buffer.Count >= header.MessageLength)
-                {
-                    ProcessMessage(header, buffer.ToArray());
-                    buffer.Clear();
-                }
+                await _stream.WriteAsync(chunk.AsMemory(0, chunk.Length));
             }
-        }
-
-        private RtmpChunkHeader? ParseChunkHeader(ReadOnlySpan<byte> data, ref int offset)
-        {
-            if (offset + 1 > data.Length) return null;
-
-            byte firstByte = data[offset++];
-            byte format = (byte)(firstByte >> 6);
-            uint chunkStreamId = (uint)(firstByte & 0x3F);
-
-            if (chunkStreamId == 0)
-            {
-                if (offset + 1 > data.Length) return null;
-                chunkStreamId = (uint)(data[offset++] + 64);
-            }
-            else if (chunkStreamId == 1)
-            {
-                if (offset + 2 > data.Length) return null;
-                chunkStreamId = (uint)(data[offset] + (data[offset + 1] << 8) + 64);
-                offset += 2;
-            }
-
-            var header = new RtmpChunkHeader { Format = format, ChunkStreamId = chunkStreamId };
-
-            // 根据格式读取其余头信息
-            switch (format)
-            {
-                case 0: // 11字节头
-                    if (offset + 11 > data.Length) return null;
-                    header.Timestamp = ReadUInt24(data, offset);
-                    header.MessageLength = ReadUInt24(data, offset + 3);
-                    header.MessageType = (RtmpMessageType)data[offset + 6];
-                    header.MessageStreamId = ReadUInt32LittleEndian(data, offset + 7);
-                    offset += 11;
-                    break;
-                case 1: // 7字节头
-                    if (offset + 7 > data.Length) return null;
-                    header.Timestamp = ReadUInt24(data, offset);
-                    header.MessageLength = ReadUInt24(data, offset + 3);
-                    header.MessageType = (RtmpMessageType)data[offset + 6];
-                    offset += 7;
-                    break;
-                case 2: // 3字节头
-                    if (offset + 3 > data.Length) return null;
-                    header.Timestamp = ReadUInt24(data, offset);
-                    offset += 3;
-                    break;
-                case 3: // 0字节头
-                    // 使用之前的头信息
-                    if (_chunkHeaders.ContainsKey(chunkStreamId))
-                    {
-                        var prevHeader = _chunkHeaders[chunkStreamId];
-                        header.Timestamp = prevHeader.Timestamp;
-                        header.MessageLength = prevHeader.MessageLength;
-                        header.MessageType = prevHeader.MessageType;
-                        header.MessageStreamId = prevHeader.MessageStreamId;
-                    }
-                    break;
-            }
-
-            _chunkHeaders[chunkStreamId] = header;
-            return header;
         }
 
         private void ProcessMessage(RtmpChunkHeader header, byte[] messageData)
