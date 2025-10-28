@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Cherry.Media;
@@ -220,10 +221,9 @@ namespace Cherry.Rtmp.Server
             try
             {
                 Console.WriteLine("Starting RTMP handshake...");
-
-                // 读取C0C1
+                // 读取C0C1（确保读满1537字节）
                 var c0c1 = new byte[1537];
-                int bytesRead = await _stream.ReadAsync(c0c1);
+                int bytesRead = await ReadExactlyAsync(c0c1, 0, c0c1.Length, TimeSpan.FromSeconds(10));
                 Console.WriteLine($"Read C0C1: {bytesRead} bytes, version: {c0c1[0]}");
 
                 if (bytesRead != 1537 || c0c1[0] != 3)
@@ -245,9 +245,9 @@ namespace Cherry.Rtmp.Server
                 await _stream.WriteAsync(s0s1s2);
                 Console.WriteLine("Sent S0S1S2");
 
-                // 读取C2
+                // 读取C2（确保读满1536字节）
                 var c2 = new byte[1536];
-                bytesRead = await _stream.ReadAsync(c2);
+                bytesRead = await ReadExactlyAsync(c2, 0, c2.Length, TimeSpan.FromSeconds(10));
                 Console.WriteLine($"Read C2: {bytesRead} bytes");
 
                 if (bytesRead != 1536)
@@ -266,6 +266,39 @@ namespace Cherry.Rtmp.Server
             }
         }
 
+        /// <summary>
+        /// 从网络流中读取指定长度的数据，直到读满或超时/发生错误。
+        /// 这是因为 NetworkStream.ReadAsync 在单次调用中可能返回不足的字节数。
+        /// </summary>
+        private async Task<int> ReadExactlyAsync(byte[] buffer, int offset, int count, TimeSpan timeout)
+        {
+            int totalRead = 0;
+            using var cts = new CancellationTokenSource(timeout);
+            try
+            {
+                while (totalRead < count && !cts.IsCancellationRequested)
+                {
+                    int read = await _stream.ReadAsync(buffer, offset + totalRead, count - totalRead, cts.Token);
+                    if (read == 0)
+                    {
+                        // 对端关闭
+                        break;
+                    }
+                    totalRead += read;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine($"ReadExactlyAsync timed out after {timeout.TotalSeconds} seconds");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"ReadExactlyAsync error: {ex.Message}");
+            }
+
+            return totalRead;
+        }
+
         private async Task ProcessMessagesAsync()
         {
             var buffer = new byte[4096];
@@ -282,6 +315,17 @@ namespace Cherry.Rtmp.Server
                     {
                         Console.WriteLine("Client closed connection (bytesRead == 0)");
                         break; // 客户端关闭连接
+                    }
+
+                    // Dump raw received bytes to temp file for debugging (append)
+                    try
+                    {
+                        var dumpPath = Path.Combine(Path.GetTempPath(), "cherry_rtmp_raw.log");
+                        File.AppendAllText(dumpPath, $"{DateTime.Now:O} RECV {bytesRead} bytes: {BitConverter.ToString(buffer, 0, bytesRead)}\n");
+                    }
+                    catch
+                    {
+                        // 忽略日志写入错误
                     }
 
                     Console.WriteLine($"Received {bytesRead} bytes of RTMP data");
@@ -396,7 +440,6 @@ namespace Cherry.Rtmp.Server
                     chunk.MessageLength = ReadUInt24(data, localOffset + 3);
                     chunk.MessageType = (RtmpMessageType)data[localOffset + 6];
                     chunk.Timestamp += prevChunk.Timestamp;
-                    chunk.MessageLength = prevChunk.MessageLength;
                     chunk.MessageStreamId = prevChunk.MessageStreamId;
                     localOffset += 7;
                     Console.WriteLine($"Format 1: Timestamp={chunk.Timestamp}, MessageLength={chunk.MessageLength}, MessageType={chunk.MessageType}, MessageStreamId={chunk.MessageStreamId}");
@@ -575,11 +618,13 @@ namespace Cherry.Rtmp.Server
         {
             Console.WriteLine("Handling createStream command");
 
+            // RTMP createStream expects _result with the stream id as the first argument
             var response = new AmfCommand
             {
                 CommandName = "_result",
                 TransactionId = command.TransactionId,
-                StreamId = 1
+                StreamId = 1,
+                Arguments = new List<object?> { 1.0 } // AMF numbers are encoded as double
             };
 
             Console.WriteLine("Sending createStream response");
@@ -868,6 +913,17 @@ namespace Cherry.Rtmp.Server
             catch
             {
                 // 忽略任何转换错误，继续发送
+            }
+
+            // Dump raw sent bytes to temp file for debugging (append)
+            try
+            {
+                var dumpPath = Path.Combine(Path.GetTempPath(), "cherry_rtmp_raw.log");
+                File.AppendAllText(dumpPath, $"{DateTime.Now:O} SEND {data.Length} bytes: {BitConverter.ToString(data)}\n");
+            }
+            catch
+            {
+                // 忽略日志写入错误
             }
 
             await _stream.WriteAsync(data);
