@@ -552,12 +552,11 @@ namespace Cherry.Rtmp.Server
             {
                 CommandName = "_result",
                 TransactionId = command.TransactionId,
+                // Use a minimal set of properties to maximize client compatibility
                 Properties = new Dictionary<string, object>
                 {
                     ["fmsVer"] = "FMS/3.5.1",
-                    ["capabilities"] = 239.0,
-                    ["objectEncoding"] = 0.0,
-                    ["app"] = app // 包含app参数
+                    ["objectEncoding"] = 0.0
                 },
                 Info = new Dictionary<string, object>
                 {
@@ -730,6 +729,52 @@ namespace Cherry.Rtmp.Server
             var data = EncodeAmfCommand(command);
             Console.WriteLine($"Encoded AMF command data: {BitConverter.ToString(data)}");
 
+            // 自解析生成的数据以便验证编码正确性
+            try
+            {
+                var parsed = ParseAmfCommand(data);
+                if (parsed != null)
+                {
+                    Console.WriteLine($"Roundtrip parse of encoded AMF: Command={parsed.CommandName}, TransactionId={parsed.TransactionId}, PropertiesCount={parsed.Properties.Count}, InfoCount={parsed.Info.Count}, Arguments={parsed.Arguments.Count}");
+
+                    if (parsed.Properties.Count > 0)
+                    {
+                        Console.WriteLine("Parsed Properties:");
+                        foreach (var kv in parsed.Properties)
+                        {
+                            Console.WriteLine($"  - {kv.Key} ({kv.Value?.GetType().Name ?? "null"}) = {kv.Value}");
+                        }
+                    }
+
+                    if (parsed.Info.Count > 0)
+                    {
+                        Console.WriteLine("Parsed Info:");
+                        foreach (var kv in parsed.Info)
+                        {
+                            Console.WriteLine($"  - {kv.Key} ({kv.Value?.GetType().Name ?? "null"}) = {kv.Value}");
+                        }
+                    }
+
+                    if (parsed.Arguments.Count > 0)
+                    {
+                        Console.WriteLine("Parsed Arguments:");
+                        for (int i = 0; i < parsed.Arguments.Count; i++)
+                        {
+                            var a = parsed.Arguments[i];
+                            Console.WriteLine($"  [{i}] ({a?.GetType().Name ?? "null"}) = {a}");
+                        }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Roundtrip parse of encoded AMF returned null (parsing failed)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error during roundtrip AMF parse: {ex.Message}");
+            }
+
             var chunk = new RtmpChunk
             {
                 Format = 0,
@@ -814,6 +859,17 @@ namespace Cherry.Rtmp.Server
         {
             Console.WriteLine($"Sending chunk: Type={chunk.MessageType}, Length={chunk.MessageLength}, StreamId={chunk.MessageStreamId}");
             var data = EncodeChunk(chunk);
+            // 打印前若干字节以便抓包/解析问题定位（限制为 64 字节）
+            int preview = Math.Min(data.Length, 64);
+            try
+            {
+                Console.WriteLine($"Encoded chunk preview ({preview} bytes): {BitConverter.ToString(data, 0, preview)}");
+            }
+            catch
+            {
+                // 忽略任何转换错误，继续发送
+            }
+
             await _stream.WriteAsync(data);
             Console.WriteLine($"Sent {data.Length} bytes to client");
         }
@@ -1012,9 +1068,39 @@ namespace Cherry.Rtmp.Server
                 var transactionId = ReadAmfNumber(data, ref offset);
                 Console.WriteLine($"Transaction ID: {transactionId}, offset after transactionId: {offset}");
 
-                // 读取命令对象
+                // 读取命令对象（properties）
                 var properties = ReadAmfObject(data, ref offset);
                 Console.WriteLine($"Properties count: {properties?.Count ?? 0}, offset after properties: {offset}");
+
+                // 读取 info 对象（通常紧随 properties 之后）
+                Dictionary<string, object>? infoObj = null;
+                // Peek next byte to decide if it's an object (0x03) or null (0x05) or other AMF type
+                if (offset < data.Length)
+                {
+                    byte nextType = data[offset];
+                    if (nextType == 0x03)
+                    {
+                        infoObj = ReadAmfObject(data, ref offset);
+                        Console.WriteLine($"Info count: {infoObj?.Count ?? 0}, offset after info: {offset}");
+                    }
+                    else if (nextType == 0x05)
+                    {
+                        // null marker for info
+                        // consume null marker
+                        offset++;
+                        Console.WriteLine($"Info is null, offset after info: {offset}");
+                    }
+                    else
+                    {
+                        // fallback: try to read as a generic value (could be number/string/object)
+                        var val = ReadAmfValue(data, ref offset);
+                        if (val is Dictionary<string, object> dict)
+                        {
+                            infoObj = dict;
+                        }
+                        Console.WriteLine($"Info parsed as value type {val?.GetType().Name ?? "null"}, offset after info: {offset}");
+                    }
+                }
 
                 // 读取其他参数
                 var arguments = new List<object?>();
@@ -1032,7 +1118,7 @@ namespace Cherry.Rtmp.Server
                     CommandName = commandName,
                     TransactionId = transactionId ?? 0,
                     Properties = properties ?? new Dictionary<string, object>(),
-                    Info = properties ?? new Dictionary<string, object>(),
+                    Info = infoObj ?? new Dictionary<string, object>(),
                     Arguments = arguments
                 };
             }
@@ -1109,7 +1195,12 @@ namespace Cherry.Rtmp.Server
             writer.Write((byte)0x03); // AMF0 object marker
             foreach (var kvp in obj)
             {
-                WriteAmfString(writer, kvp.Key);
+                // Property names inside an AMF0 object are written as
+                // 2-byte big-endian length followed by UTF-8 bytes (no type marker).
+                var keyBytes = System.Text.Encoding.UTF8.GetBytes(kvp.Key);
+                writer.Write((byte)(keyBytes.Length >> 8));
+                writer.Write((byte)keyBytes.Length);
+                writer.Write(keyBytes);
                 WriteAmfValue(writer, kvp.Value);
             }
             // End marker
@@ -1160,9 +1251,10 @@ namespace Cherry.Rtmp.Server
 
         private void WriteUInt24(BinaryWriter writer, uint value)
         {
-            writer.Write((byte)value);
-            writer.Write((byte)(value >> 8));
-            writer.Write((byte)(value >> 16));
+            // Write 3-byte unsigned int in BIG-ENDIAN order (network order)
+            writer.Write((byte)((value >> 16) & 0xFF));
+            writer.Write((byte)((value >> 8) & 0xFF));
+            writer.Write((byte)(value & 0xFF));
         }
 
         private void WriteUInt32LittleEndian(BinaryWriter writer, uint value)
